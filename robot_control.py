@@ -32,6 +32,10 @@ class RobotConnectionConfig:
     robot_sn: str
     command_frequency_hz: int = 20
     operational_timeout_s: float = 120.0
+    max_linear_vel: float = 0.05
+    max_angular_vel: float = 0.5
+    max_linear_acc: float = 0.2
+    max_angular_acc: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.robot_sn:
@@ -40,6 +44,14 @@ class RobotConnectionConfig:
             raise ValueError("command_frequency_hz must be in [1, 100]")
         if self.operational_timeout_s <= 0:
             raise ValueError("operational_timeout_s must be greater than 0")
+        motion_limits = (
+            self.max_linear_vel,
+            self.max_angular_vel,
+            self.max_linear_acc,
+            self.max_angular_acc,
+        )
+        if any(value <= 0 for value in motion_limits):
+            raise ValueError("Cartesian motion limits must be positive")
 
 
 class FlexivRobotController:
@@ -97,6 +109,7 @@ class FlexivRobotController:
         """Servo on the robot and wait until it becomes operational."""
 
         robot = self._require_robot()
+        self.clear_fault_if_any()
         robot.ServoOn()
 
         deadline = time.monotonic() + self.config.operational_timeout_s
@@ -110,9 +123,7 @@ class FlexivRobotController:
 
         rdk = self._require_rdk()
         robot = self._require_robot()
-        self._single_arm_groups = dict(robot.info().single_arm_groups)
-        if not self._single_arm_groups:
-            raise RuntimeError("No single-arm joint group found on the connected robot")
+        self._ensure_single_arm_groups()
 
         robot.SwitchMode(rdk.Mode.NRT_CARTESIAN_MOTION_FORCE)
         for group in self._single_arm_groups:
@@ -130,10 +141,10 @@ class FlexivRobotController:
         ``[x, y, z, q_w, q_x, q_y, q_z]`` in meters and quaternion orientation.
         """
 
-        if not self._single_arm_groups:
-            self.prepare_for_cartesian_motion()
+        self._ensure_single_arm_groups()
 
         selected_group = group if group is not None else next(iter(self._single_arm_groups))
+        self._validate_group(selected_group)
         states_by_group = self.read_states()
         if selected_group not in states_by_group:
             raise RuntimeError("Selected joint group has no robot state")
@@ -161,6 +172,7 @@ class FlexivRobotController:
             self.prepare_for_cartesian_motion()
 
         selected_group = group if group is not None else next(iter(self._single_arm_groups))
+        self._validate_group(selected_group)
         base_pose = (
             list(reference_pose)
             if reference_pose is not None
@@ -175,9 +187,19 @@ class FlexivRobotController:
                 raise RuntimeError("Fault occurred while sending Cartesian trajectory")
 
             target_pose = base_pose.copy()
-            target_pose[0:3] = point.tolist()
+            target_pose[0:3] = [float(value) for value in point]
             robot.SendCartesianMotionForce(
-                {selected_group: rdk.NrtCartesianCmd(target_pose)}
+                {
+                    selected_group: rdk.NrtCartesianCmd(
+                        target_pose,
+                        [0.0] * 6,
+                        [0.0] * 6,
+                        self.config.max_linear_vel,
+                        self.config.max_angular_vel,
+                        self.config.max_linear_acc,
+                        self.config.max_angular_acc,
+                    )
+                }
             )
             time.sleep(period)
 
@@ -196,6 +218,19 @@ class FlexivRobotController:
         if self._robot is None:
             raise RuntimeError("Robot is not connected. Call connect() first.")
         return self._robot
+
+    def _ensure_single_arm_groups(self) -> None:
+        if self._single_arm_groups:
+            return
+
+        robot = self._require_robot()
+        self._single_arm_groups = dict(robot.info().single_arm_groups)
+        if not self._single_arm_groups:
+            raise RuntimeError("No single-arm joint group found on the connected robot")
+
+    def _validate_group(self, group: Any) -> None:
+        if group not in self._single_arm_groups:
+            raise ValueError("Selected joint group is not an available single-arm group")
 
 
 class DryRunRobotController:
@@ -253,7 +288,7 @@ class DryRunRobotController:
         self.sent_poses.clear()
         for point in points:
             pose = base_pose.copy()
-            pose[0:3] = point.tolist()
+            pose[0:3] = [float(value) for value in point]
             self.sent_poses.append(pose)
 
         if self.sent_poses:
